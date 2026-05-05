@@ -68,6 +68,8 @@ Optional but recommended:
   cd - change working directory
   resume - adopt a Claude CLI transcript from ~/.claude/projects
   status - show active session status
+  bash - run a shell command after Allow/Deny approval
+  run - alias for bash
   ```
 
 ## 2. Find your Telegram user ID
@@ -147,6 +149,7 @@ Optional (general):
 | `AGENT_BRIDGE_CWD`          | `$HOME`                                  | Initial working directory for the first session                      |
 | `BRIDGE_BACKEND`            | `claude`                                 | Default backend: `claude`, `opencode`, or `codex`                   |
 | `AGENT_BRIDGE_STATE_FILE`   | `~/.agent-telegram-bridge/state.json`    | Where the bridge persists its session snapshot for restart recovery |
+| `AGENT_BRIDGE_BASH_TIMEOUT` | `120`                                    | Max seconds for manual `/bash` or `/run` commands                   |
 
 Optional (claude backend):
 
@@ -228,6 +231,14 @@ bridge starting (cwd=..., model=..., allowed=[12345678])
 | `/cd <path>`    | Change cwd of the active session (takes effect on next message)         |
 | `/resume [id\|prefix]` | Adopt a Claude CLI transcript from `~/.claude/projects` as a new bridge session. With no args, lists the most recent transcripts in the active session's cwd as inline buttons; tap one to adopt it. With an id/prefix, adopts directly without the picker |
 | `/status`       | Show running state and pending approvals for the active session         |
+| `/bash <cmd>`   | Run a shell command in the active session cwd after an inline Allow/Deny approval |
+| `/run <cmd>`    | Alias for `/bash <cmd>`                                                 |
+
+Manual shell commands are useful for Codex sessions when Codex is blocked by
+its own sandbox or by network restrictions. Codex can tell you the exact
+command it needs; you send it as `/bash <command>`, approve the inline prompt,
+and the bridge runs it on your computer in the active session's cwd. This does
+not weaken Codex's sandbox. It is a separate user-approved bridge action.
 
 ### Multiple sessions
 

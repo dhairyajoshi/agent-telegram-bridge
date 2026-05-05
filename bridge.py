@@ -42,6 +42,7 @@ Commands in chat:
     /cd <path>            change cwd of the active session
     /resume [id|prefix]   adopt a Claude CLI session from disk
     /status               status of active session
+    /bash <command>        run a shell command in active cwd after approval
 """
 from __future__ import annotations
 
@@ -120,6 +121,7 @@ def get_backend(name: str) -> Backend:
 
 MAX_MSG_LEN = 3500
 APPROVAL_TIMEOUT_S = 600
+BASH_TIMEOUT_S = int(os.environ.get("AGENT_BRIDGE_BASH_TIMEOUT", "120"))
 
 
 # ---- Per-chat / per-session state -----------------------------------------
@@ -252,6 +254,12 @@ async def send_chunked(bot, chat_id: int, text: str, *,
             await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=parse_mode)
         except BadRequest:
             await bot.send_message(chat_id=chat_id, text=chunk)
+
+
+def message_arg_text(update: Update) -> str:
+    text = update.effective_message.text if update.effective_message else ""
+    parts = text.split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
 
 
 def render_tool_call(name: str, inp: dict) -> str:
@@ -1139,6 +1147,108 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_bash(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return await deny(update)
+    if not update.effective_message:
+        return
+    command = message_arg_text(update)
+    if not command:
+        await update.effective_message.reply_text(
+            "Usage: /bash <command>\nAlias: /run <command>"
+        )
+        return
+    c, s = get_or_create_active(update.effective_chat.id)
+    allowed = await make_permission_asker(c, ctx.bot)(
+        "Bash",
+        {
+            "command": command,
+            "description": f"Manual shell command in {s.cwd}",
+        },
+    )
+    if not allowed:
+        await update.effective_message.reply_text("❌ Command denied.")
+        return
+
+    started = time.time()
+    status_msg = await update.effective_message.reply_text(
+        f"▶️ Running in #{s.sid}: <code>{html.escape(s.cwd)}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=s.cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=BASH_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            stdout_b, stderr_b = await proc.communicate()
+            elapsed = int(time.time() - started)
+            await send_bash_result(
+                ctx.bot,
+                update.effective_chat.id,
+                command,
+                s.cwd,
+                -1,
+                stdout_b,
+                stderr_b + f"\nTimed out after {elapsed}s".encode(),
+            )
+            return
+        await send_bash_result(
+            ctx.bot,
+            update.effective_chat.id,
+            command,
+            s.cwd,
+            proc.returncode or 0,
+            stdout_b,
+            stderr_b,
+        )
+    except Exception as e:
+        log.exception("manual bash failed")
+        await update.effective_message.reply_text(f"❌ Failed to run command: {e}")
+    finally:
+        try:
+            elapsed = int(time.time() - started)
+            await status_msg.edit_text(f"✅ Shell command finished in {elapsed}s")
+        except Exception:
+            pass
+
+
+async def send_bash_result(bot, chat_id: int, command: str, cwd: str,
+                           returncode: int, stdout_b: bytes,
+                           stderr_b: bytes) -> None:
+    stdout = stdout_b.decode(errors="replace").strip()
+    stderr = stderr_b.decode(errors="replace").strip()
+    header = (
+        f"<b>Shell result</b> exit=<code>{returncode}</code>\n"
+        f"cwd: <code>{html.escape(cwd)}</code>\n"
+        f"cmd:\n<pre>{html.escape(command[:1200])}</pre>"
+    )
+    await send_chunked(bot, chat_id, header, parse_mode=ParseMode.HTML)
+    if stdout:
+        await send_chunked(
+            bot,
+            chat_id,
+            "<b>stdout</b>\n<pre>" + html.escape(stdout) + "</pre>",
+            parse_mode=ParseMode.HTML,
+        )
+    if stderr:
+        await send_chunked(
+            bot,
+            chat_id,
+            "<b>stderr</b>\n<pre>" + html.escape(stderr) + "</pre>",
+            parse_mode=ParseMode.HTML,
+        )
+    if not stdout and not stderr:
+        await bot.send_message(chat_id=chat_id, text="(no output)")
+
+
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return await deny(update)
@@ -1264,6 +1374,8 @@ def main() -> None:
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("bash", cmd_bash))
+    app.add_handler(CommandHandler("run", cmd_bash))
     app.add_handler(CallbackQueryHandler(on_callback_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
